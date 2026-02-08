@@ -1,636 +1,881 @@
 # ARCHITECTURE.md
 
-## 0. Document Scope
+## 1. Purpose
 
-This document is the implementation-level architecture spec for `lua-local-deleted-tool`.
-It is intentionally strict and maps directly to current code paths in:
+This document is the implementation-level architecture for the current repository state.
+It is intentionally grounded in actual code paths and function contracts.
 
+This version documents:
 - `main.lua`
 - `src/*.lua`
-- `test/*.lua`
+- root config/document files that drive runtime behavior
 
-Primary goals:
-
-- Explain exact runtime flow from CLI input to output artifacts
-- Define data contracts between lexer/parser/transformers
-- Define safety invariants and fallback behavior
-- Provide extension and regression strategy
-
-Target runtime:
-
-- Lua 5.4 CLI (`lua54`)
-- Source language focus: Lua 5.1 style + practical Luau syntax seen in the codebase
+This version intentionally excludes:
+- `test/` directory
+- sample input files used only as fixtures (`test.lua`)
 
 ---
 
-## 1. System Context and Non-goals
+## 2. Runtime Overview
 
-### 1.1 What this tool does
+At runtime, the tool is a single-process CLI pipeline:
 
-- Local keyword transformations (`functionlocal`, `localkw`, `localtabke`, `localcyt`, `localte`, `localnum`, etc.)
-- Formatting (`fom`)
-- Minification/compression (`coml`)
-- Numeric expression simplification (`nmbun`)
-- Local identifier renaming (`rename`)
-- Comment stripping (`deleteout`, `outcode`)
-- Conservative dead local cleanup (`nocode`)
-- Static analysis (`lint`)
-- Require dependency graphing (`rrequire`)
-- Step pipeline execution (`preset`)
+1. Parse CLI arguments in `main.lua`
+2. Load source file
+3. Analyze source safety baseline (`src/safety.lua`)
+4. Run selected command implementation
+5. Run safety guard against regressions
+6. Write transformed source to `output/<filename>`
+7. Write report files (`.safety.json` and command-specific JSON when applicable)
 
-### 1.2 Non-goals
-
-- Full Lua compiler pipeline (bytecode backend)
-- Whole-program type system
-- Aggressive unsafe optimization
-- Perfect semantic preservation under malformed input
+Core architectural invariant:
+- If input was parseable, output must stay parseable.
+- If input was compilable, output must stay compilable.
+- On regression, output is automatically reverted to original source.
 
 ---
 
-## 2. Module Topology
+## 3. Repository Inventory (Non-test)
 
-### 2.1 Core runtime modules
+### 3.1 Root files
 
-- `main.lua`: CLI parser, mode mapping, orchestration, output/report writing
-- `src/safety.lua`: parse/compile/lint safety gate used by all commands
-- `src/json.lua`: deterministic JSON encode/decode helper
+| Path | Role |
+|---|---|
+| `main.lua` | CLI entrypoint, command dispatcher, report writer |
+| `preset.json` | Default multi-step pipeline config |
+| `README.md` | User-facing usage guide |
+| `ARCHITECTURE.md` | This technical architecture spec |
 
-### 2.2 Parsing pipeline modules
+### 3.2 Source modules
 
-- `src/lexer.lua`: compact tokenization for AST-oriented paths
-- `src/parser.lua`: recursive-descent parser
-- `src/ast.lua`: AST constructors
-- `src/codegen.lua`: AST to Lua code generation
-
-### 2.3 Transform/analysis modules
-
-- `src/transformer.lua`: AST-based local transformations
-- `src/transformer_line.lua`: position-based line-preserving local transformations
-- `src/analyzer.lua`: local symbol stats collection (used for summary)
-- `src/optimizer.lua`: conservative constant folding and control simplification
-
-### 2.4 Feature modules
-
-- `src/formatter.lua`
-- `src/compressor.lua`
-- `src/nmbun.lua`
-- `src/renamer.lua`
-- `src/deleteout.lua`
-- `src/nocode.lua`
-- `src/linter.lua`
-- `src/rrequire.lua`
-- `src/preset.lua`
-
-### 2.5 Debug/test modules
-
-- `test/debug_tokens.lua`
-- `test/debug_parser.lua`
-- `test/debug_ast.lua`
-- `test/debug_parse_suite.lua`
-- `test/debug_local_modes.lua`
+| Path | Role |
+|---|---|
+| `src/ast.lua` | AST node constructors |
+| `src/lexer.lua` | parser-facing lexer (token classes like `LOCAL`, `IDENT`) |
+| `src/lexer_full.lua` | full-fidelity lexer (comments/newlines/symbol streams) |
+| `src/parser.lua` | recursive-descent parser |
+| `src/codegen.lua` | AST -> Lua source generator |
+| `src/analyzer.lua` | local symbol counting (summary usage) |
+| `src/transformer.lua` | AST-based local-removal transformer |
+| `src/transformer_line.lua` | line-preserving local-removal transformer (default engine) |
+| `src/formatter.lua` | readability formatter (`fom`) |
+| `src/compressor.lua` | minifier + AST optimization + safety validation (`coml`) |
+| `src/optimizer.lua` | constant folding / control simplification |
+| `src/nmbun.lua` | expression simplification command runner |
+| `src/renamer.lua` | local variable rename engine |
+| `src/deleteout.lua` | comment stripping with token-boundary safety |
+| `src/nocode.lua` | conservative dead local code removal |
+| `src/linter.lua` | static lint + dynamic lint integration |
+| `src/lint_dynamic.lua` | runtime lint execution + result aggregation |
+| `src/lint_sandbox.lua` | isolated runtime sandbox + dependency tracing |
+| `src/rrequire.lua` | require/dependency graph analysis |
+| `src/preset.lua` | preset pipeline runner |
+| `src/safety.lua` | parse/compile/lint safety guard |
+| `src/json.lua` | deterministic JSON encode/decode |
+| `src/dialect.lua` | dialect resolver interface (currently single fixed profile) |
 
 ---
 
-## 3. CLI Contract (main.lua)
+## 4. `main.lua` Deep Flow
 
-### 3.1 Input grammar
+### 4.1 CLI shape
 
-```text
-lua54 main.lua [--engine=line|ast] <mode> [scope] <inputfile> [presetfile]
+Current accepted shape:
+
+```bash
+lua54 main.lua [--engine=line|ast] [--lint-dynamic=on|off] <mode> [scope] <inputfile> [presetfile]
 ```
 
-### 3.2 Mode classes
+Notes on option parsing behavior in current code:
+- `--engine=...` is parsed and used.
+- `--lint-dynamic=...` is parsed and used.
+- `--dialect=...` is detected in argument loop but not applied to runtime dialect variable in `main.lua`.
 
-Direct command handlers in `process_file()`:
+### 4.2 Command dispatch
 
-- `fom`
-- `coml`
-- `nmbun`
-- `rename`
-- `deleteout`
-- `nocode`
-- `lint`
-- `rrequire`
-- `preset`
+`process_file()` handles command groups:
 
-Engine-backed transform family:
+- Direct handlers:
+  - `fom`, `coml`, `nmbun`, `rename`, `deleteout`, `nocode`, `lint`, `rrequire`, `preset`
+- Engine-backed handlers:
+  - `functionlocal`, `localkw`, `localte`, `localc`, `localcyt`, `localnum`, `localtabke`, `outcode`, `localtur`
 
-- `functionlocal`
-- `localkw`
-- `localtabke`
-- `localcyt`
-- `localc`
-- `localte`
-- `localnum`
-- `localtur` (compat alias path in current parser)
-- `outcode`
+For engine-backed handlers:
+- `line` engine -> `TransformerLine`
+- `ast` engine -> `Lexer` -> `Parser` -> `Analyzer` -> `Transformer` -> `CodeGen`
 
-### 3.3 Mode mapping example
+### 4.3 Finalization wrapper
+
+Every command result is wrapped by `finalize()`:
 
 ```lua
-elseif mode_name == 'localnum' then
-  if scope == 'function' then
-    mode = 'remove_local_number_function'
-  elseif scope == 'global' then
-    mode = 'remove_local_number_global'
-  else
-    mode = 'remove_local_number_all'
-  end
+local guarded_output, safety_report = Safety.guard(mode, source, output_code, pre_analysis, { dialect = dialect.name })
 ```
 
-### 3.4 Engine semantics
+Then `.safety.json` is appended to `meta.extra_reports` for output emission.
 
-- default: `line`
-- `line`: `TransformerLine` (layout-preserving bias)
-- `ast`: `Lexer -> Parser -> Analyzer -> Transformer -> CodeGen`
+### 4.4 Output behavior
+
+Main output:
+- `output/<input_filename>`
+
+Optional reports:
+- `output/<input_filename>.lint.json`
+- `output/<input_filename>.rrequire.json`
+- `output/<input_filename>.preset.json`
+- always `output/<input_filename>.safety.json`
+
+Local summary is printed from `analyzer.all_locals` after write.
 
 ---
 
-## 4. End-to-end Execution Flow
+## 5. Shared Data Contracts
 
-### 4.1 Canonical flow
-
-1. `read_file(input)`
-2. `pre_analysis = Safety.analyze_source(source)`
-3. run mode-specific transform/analyze
-4. `Safety.guard(mode, input, output, pre_analysis)`
-5. write `output/<file>`
-6. write optional report (`.lint.json`, `.rrequire.json`, `.preset.json`)
-7. always write `.safety.json`
-
-### 4.2 Guard wrapper (main.lua)
-
-```lua
-local function finalize(output_code, analyzer, meta)
-  local guarded_output, safety_report = Safety.guard(mode, source, output_code, pre_analysis)
-  local final_meta = meta or {}
-  final_meta.extra_reports = final_meta.extra_reports or {}
-  final_meta.extra_reports[#final_meta.extra_reports + 1] = {
-    suffix = '.safety.json',
-    data = safety_report
-  }
-  return guarded_output, analyzer or { all_locals = {} }, final_meta
-end
-```
-
-### 4.3 Output trim policy
-
-`main.lua` trims trailing newlines for most code-mutating modes, but skips trim for:
-
-- `rename`
-- `deleteout`
-- `nocode`
-- `lint`
-- `rrequire`
-- `preset`
-
-Rationale: preserve intended layout/report behavior.
-
----
-
-## 5. Token Models
-
-## 5.1 `src/lexer.lua` token contract
+## 5.1 Parser-lexer token model (`src/lexer.lua`)
 
 Shape:
 
 ```lua
-{ type = 'IDENT', value = 'x', line = 10, col = 5 }
+{ type = 'IDENT', value = 'foo', line = 10, col = 5 }
 ```
 
-Characteristics:
+Examples of emitted token types:
+- keywords: `LOCAL`, `FUNCTION`, `IF`, `FOR`, ...
+- symbols: `ASSIGN`, `LPAREN`, `RBRACE`, `CONCAT`, `IDIV`, `DBLCOLON`, ...
+- literals: `NUMBER`, `STRING`
+- control: `EOF`
 
-- Skips whitespace/comments
-- Emits parser-facing token classes (`LOCAL`, `IDENT`, `ASSIGN`, ...)
-- Converts numeric text using `tonumber(value)`
-- Emits EOF token
-
-### Risk note
-
-`read_number()` accepts `[0-9a-fxA-FX.]` before exponent handling, so malformed edge strings can propagate to `tonumber(nil)` behavior depending on source text.
-
-## 5.2 `src/lexer_full.lua` token contract
+## 5.2 Full-fidelity token model (`src/lexer_full.lua`)
 
 Shape:
 
 ```lua
-{ type = 'comment', value = '--[[...]]', line = 1, col = 1, is_block = true }
+{ type = 'comment', value = '--[[x]]', line = 1, col = 1, is_block = true }
 ```
 
-Token kinds include:
-
+Token classes used by formatting/minification/comment stripping:
 - `keyword`, `ident`, `number`, `string`, `long_string`
-- `symbol`
-- `comment`
-- `newline`
+- `symbol`, `comment`, `newline`
 
-Key capability:
+## 5.3 AST model (`src/ast.lua`)
 
-- Preserves comment/newline boundaries for formatter/minifier/comment-strip paths.
+Core node constructors:
+- structural: `Chunk`, `Block`
+- declarations: `LocalDecl`, `LocalFunc`, `FunctionDecl`, `Function`
+- statements: `Assignment`, `If`, `While`, `Repeat`, `For`, `ForIn`, `Do`, `Return`, `Break`, `Continue`, `Goto`, `Label`
+- expressions: `Identifier`, `BinaryOp`, `UnaryOp`, `FunctionCall`, `MethodCall`, `IndexExpr`, `PropertyExpr`, `Table`, `TableField`, `VarArgs`, literals
 
----
-
-## 6. Parser and AST Contract
-
-## 6.1 Recursive descent entrypoints
-
-- `parse()` -> `parse_chunk()`
-- `parse_statement()` dispatches statement forms
-- `parse_expression()` dispatches precedence chain
-
-## 6.2 Expression precedence (current implementation order)
-
-1. `or`
-2. `and`
-3. `not`
-4. comparison (`< <= > >= == ~=`)
-5. concat (`..`)
-6. additive (`+ -`)
-7. multiplicative (`* / // %`)
-8. unary (`- not #`)
-9. power (`^`, right-associative)
-10. postfix (`()`, `[]`, `.`, `:`)
-11. primary
-
-## 6.3 AST shape examples (`src/ast.lua`)
-
-```lua
-AST.LocalDecl(names, values)
-AST.Assignment(targets, values)
-AST.FunctionDecl(name, params, body, is_local)
-AST.If(condition, then_body, elseif_parts, else_body)
-AST.Table(fields)
-```
-
-Parser enriches some nodes with metadata used by later stages:
-
+Parser-attached metadata used downstream:
 - `source_line`
-- `local_token`
-- `name_token`, `name_tokens`
-- `param_tokens`
-- `var_token`, `var_tokens`
-
-These fields are critical for:
-
-- line-precise local keyword removal
-- byte-span identifier replacement in renaming
+- `local_token`, `name_token`, `name_tokens`
+- `param_tokens`, `var_token`, `var_tokens`
 
 ---
 
-## 7. Engine Implementations
+## 6. Parsing and Code Generation
 
-## 7.1 Line engine (`src/transformer_line.lua`)
+## 6.1 `src/parser.lua`
 
-Design intent:
+Parser style:
+- recursive descent
+- explicit precedence chain
+- feature gate hooks (`feature_enabled`, `expect_feature`)
 
-- Keep original layout as much as possible
-- Remove only targeted `local` tokens by line/column position
+Expression precedence path:
+- `or` -> `and` -> unary `not`
+- comparison
+- bitwise `| ~ & << >>`
+- concat `..`
+- additive `+ -`
+- multiplicative `* / // %`
+- unary `- not # ~`
+- power `^`
+- postfix calls/index/property/method
+- primary
 
-Pipeline:
+Statement support includes:
+- local declarations/functions
+- function declarations
+- labels/goto/continue
+- if/while/repeat/for/do
+- assignment and expression statements
+- return/break
 
-1. Parse AST (preferred)
-2. collect removable local-token positions
-3. fallback to token scan if AST path fails
-4. apply removals right-to-left per line
+Luau-oriented tolerant parsing helpers:
+- local attributes (`<const>`) skipping
+- optional type annotation skipping
+- optional function generic skipping
+- type declaration skipping
 
-Key decision function:
+Code example (assignment target validation):
 
 ```lua
-local function should_remove_local(node, mode, in_function)
-  ...
+for _, target in ipairs(targets) do
+  if not is_assignable_target(target) then
+    error("Invalid assignment target")
+  end
 end
 ```
 
-Scope logic:
+## 6.2 `src/codegen.lua`
 
-- `all`, `function`, `global` via `scope_match()` and `get_scope_mode()`
+Responsibilities:
+- generate source from AST
+- preserve existing indentation where possible when source lines are available
+- safely quote strings (`quote_lua_string`)
 
-Type-targeted modes:
+Key behavior:
+- `CodeGen.new(source)` stores `source_lines`
+- `generate_chunk()` replaces only modified source lines when metadata exists
+- pure regeneration mode via `CodeGen.new(nil)`
 
-- table/string/boolean/number by `decl_values_match_type()` and token fallback classifier.
-
-## 7.2 AST engine (`src/transformer.lua`)
-
-Design intent:
-
-- Structural rewrite of AST nodes
-- Convert `LocalDecl`/`LocalFunc` to assignment/function declarations based on mode
-
-Flow:
-
-- recursive `walk_node()` with function-depth tracking (`in_function`, `function_depth`)
-
-Important behavior:
-
-- Keeps nodes unchanged if mode/scope does not match
-- marks transformed nodes with `modified = true`
-
-### Technical debt note
-
-`Transformer` currently has duplicated mode branches and only partial support for all mode combinations compared to line engine. Line engine is the authoritative default path.
-
----
-
-## 8. Code Generation (`src/codegen.lua`)
-
-## 8.1 Dual operation mode
-
-- `CodeGen.new(source)` with source-line preservation attempt
-- `CodeGen.new(nil)` pure regeneration mode
-
-## 8.2 Modified-line replacement logic
-
-`generate_chunk()` scans for nodes with `modified + source_line` and replaces matching source line content.
-
-## 8.3 String emission
-
-Uses `quote_lua_string()` to escape control bytes safely:
-
-- `\n`, `\t`, `\r`, `\"`, `\\`
-- non-printable bytes as `\ddd`
-
----
-
-## 9. Command Internals
-
-## 9.1 `fom` (`src/formatter.lua`)
-
-Algorithm:
-
-- tokenize with `lexer_full`
-- infer indent style (`tabs` vs `spaces`, GCD width)
-- stream tokens with spacing and line-break policy
-- special multiline expansion for UI-style call tables
-
-Critical merge safety:
+Code example (string escaping):
 
 ```lua
-if merge_pairs[prev.value .. nxt.value] then return true end
+elseif b < 32 or b == 127 then
+  out[#out + 1] = string.format('\\%03d', b)
+end
 ```
 
-## 9.2 `coml` (`src/compressor.lua`)
+---
+
+## 7. Transformation Engines
+
+## 7.1 `src/transformer_line.lua` (default)
+
+Design target:
+- remove selected `local` tokens while preserving line layout
 
 Algorithm:
+1. Parse AST if possible
+2. Collect exact `local_token` positions to remove
+3. Fallback to token heuristics if AST parse fails
+4. Apply removals right-to-left per line
 
-1. compute source parse/compile status
-2. if parseable and optimize enabled: AST optimize + codegen candidate
-3. always build raw minify candidate
-4. validate candidate:
-   - `lexer_full` re-tokenization must succeed
-   - preserve compile ability if source compiled
-   - else preserve parse ability if source parsed
-5. first valid candidate wins; else return source
+Also includes `outcode` logic for line-based comment-out stripping.
 
-Comment/newline collapse uses semicolon insertion at statement boundaries when required.
+Scope model:
+- `all`, `function`, `global`
 
-## 9.3 `nmbun` (`src/nmbun.lua`)
+Typed local removal support:
+- boolean, string, number, table
 
-- parse AST
-- apply `Optimizer.optimize()` 3 passes
-- emit code
-- on failure return original source
+## 7.2 `src/transformer.lua` (AST engine)
 
-## 9.4 `rename` (`src/renamer.lua`)
+Design target:
+- rewrite AST nodes for local-removal modes
 
-Renaming strategy:
+Core behavior:
+- converts eligible `LocalDecl` into `Assignment`
+- converts eligible `LocalFunc` into `FunctionDecl`
+- tracks function depth via `in_function` and `function_depth`
 
-- Collect used names to avoid collisions
-- Generate short names with randomized cycle per length
-- Build lexical scopes and map declarations/references consistently
-- Apply text replacements by byte spans in reverse order
+Current status:
+- line engine is default and more operationally trusted for layout-sensitive commands.
 
-Span application invariant:
+## 7.3 `src/analyzer.lua`
 
-- replacements must match exact old text at computed positions
-- overlapping replacements are naturally avoided by reverse ordering
+Purpose:
+- collect local declarations/reference counts for CLI summary output
 
-## 9.5 `deleteout` (`src/deleteout.lua`)
+Important implementation note:
+- `walk_chunk()` currently iterates `node.body` directly, while `Chunk.body` is a `Block` object.
+- This can reduce accuracy of analyzer summaries in some AST-engine paths.
 
-- find comment spans via `lexer_full`
-- replace comment bytes while preserving newline bytes
-- if empty replacement would concatenate tokens unsafely, inject single space
+---
 
-## 9.6 `nocode` (`src/nocode.lua`)
+## 8. Command Modules
+
+## 8.1 `src/formatter.lua` (`fom`)
 
 Pipeline:
+- tokenize with `lexer_full`
+- detect indent style from source
+- stream tokens with spacing and newline policies
+- preserve block readability (`if/then/end`, function headers, table literals)
 
-1. parse AST
-2. optimizer pass
-3. repeated prune loop (max 20)
-4. regenerate
-5. parse/compile regression checks against source
+Special readability behavior:
+- expands table argument formatting for UI-style calls
+- adds top-level blank lines before structural blocks
 
-Pruning rule (conservative):
+Code example:
 
-- remove `LocalFunc` with zero refs
-- remove `LocalDecl` only when all symbols unused and initializer expressions are pure
+```lua
+if should_expand_call_table(tokens, idx) then
+  flush_line(true)
+  indent = indent + 1
+end
+```
 
-## 9.7 `lint` (`src/linter.lua`)
+## 8.2 `src/compressor.lua` (`coml`)
 
-Detects:
+Pipeline:
+1. Check source parse/compile capability
+2. Optional AST optimize (`Optimizer`) + codegen candidate
+3. Build token-stream minify candidate
+4. Validate candidate with tokenization + parse/compile invariants
+5. Return first valid candidate else original
 
-- `unused-variable`
-- `undefined-reference`
+Safety checks are conservative and explicit.
+
+Code example:
+
+```lua
+if source_compile_ok then
+  if not can_compile(candidate) then return false end
+elseif source_parse_ok then
+  if not can_parse_with_ast(candidate, dialect) then return false end
+end
+```
+
+## 8.3 `src/deleteout.lua` (`deleteout`)
+
+Behavior:
+- remove all comments (`--`, long bracket comments)
+- preserve line structure by keeping newline bytes from comments
+- inject a single separating space when token concatenation would become unsafe
+
+## 8.4 `src/optimizer.lua` + `src/nmbun.lua` (`nmbun`)
+
+`Optimizer`:
+- constant folds literal binary/unary expressions
+- simplifies conditionals (`if` pruning)
+- removes guaranteed-dead loops/empty `do` blocks
+- truncates block after guaranteed termination statements
+
+`Nmbun.run`:
+- parse -> run optimizer 3 passes -> codegen
+- fallback to original source on any failure
+
+## 8.5 `src/renamer.lua` (`rename`)
+
+Design:
+- lexical-scope-aware renaming for local variables/params/for-vars
+- short random names with collision avoidance
+- reverse-order byte-span replacement to avoid overlap corruption
+
+Important constraints:
+- does not rename globals intentionally
+- supports protected names (`options.protected_names`)
+
+Code example:
+
+```lua
+if source:sub(start_pos, end_pos) == rep.old then
+  spans[#spans + 1] = { start_pos = start_pos, end_pos = end_pos, new = rep.new }
+end
+```
+
+## 8.6 `src/nocode.lua` (`nocode`)
+
+Goal:
+- conservative dead local code elimination
+
+Pipeline:
+1. Parse AST
+2. Optimize AST
+3. Analyze symbol refs and side-effect risk
+4. Iteratively prune (`max 20` iterations)
+5. Re-generate and validate parse/compile regressions
+
+Removal rules are conservative:
+- remove unused `LocalFunc`
+- remove `LocalDecl` only when all declared symbols are unused and initializer expressions are pure
+
+---
+
+## 9. Lint Architecture
+
+## 9.1 `src/linter.lua` static lint
+
+Static checks include:
 - `duplicate-local`
 - `shadowing`
+- `unused-variable`
+- `undefined-reference`
 - `type-mismatch`
-- `global-write`
-- `global-overwrite`
+- `suspicious-compare`
 - `call-non-function`
 - `self-assignment`
-- `unreachable-code`
+- `global-write`
+- `global-overwrite`
 - `useless-expression`
+- `unreachable-code`
 
-Output is report-only; source text remains unchanged.
+Static analysis components:
+- scope creation/lookup
+- symbol declaration/reference counting
+- lightweight type inference
+- side-effect detection for expression statements
+- termination analysis for unreachable code
 
-## 9.8 `rrequire` (`src/rrequire.lua`)
+## 9.2 `src/lint_dynamic.lua` + `src/lint_sandbox.lua`
 
-Two-stage extraction:
+Dynamic lint model:
+- execute input in isolated sandbox env
+- enforce instruction budget via `debug.sethook`
+- optionally probe callable targets
+- aggregate runtime events and dependency traces
 
-1. AST extraction of require calls and aliases
-2. token fallback extraction if parser path fails
+Sandbox traces include:
+- all/resolved/unresolved/undefined global reads
+- global writes
+- proxy root and nested proxy reads
+- `require` calls
+- metatable gets/sets/metamethod usage
+- event stream and chronological history
 
-Resolution strategy:
+Dynamic report object contains:
+- `dependencies.globals`
+- `dependencies.metatable`
+- `dependencies.proxies`
+- `dependencies.require`
+- `history` + `history_stats`
+- `map_stats` truncation information
+- `execution` probe metrics
+- `runtime.main` status/error
 
-- relative from caller dir
-- root-dir fallback
-- `.lua` and `init.lua` candidate patterns
-- `package.path` pattern expansion support
-
-Also records:
-
-- unresolved requires
-- dynamic require calls
-- parse errors
-- dependency cycles
-
-## 9.9 `preset` (`src/preset.lua`)
-
-- decode preset JSON
-- execute steps sequentially on in-memory `current_source`
-- each step may choose engine
-- each step guarded by `Safety.guard`
-- optional per-step output/report writing
-- final preset report emitted
-
-Sequential overwrite contract:
-
-- step N output is exact input for step N+1
-- no branch fan-out unless explicit output snapshots enabled
-
----
-
-## 10. Safety Invariants
-
-Global invariants enforced in `src/safety.lua`:
-
-1. If input was parseable, output must remain parseable
-2. If input was compilable, output must remain compilable
-3. On invariant break, output falls back to original input
-
-Guard decision core:
+Code example (dependency block in dynamic output):
 
 ```lua
-if before.parse_ok and not after.parse_ok then
-  fallback_applied = true
-elseif before.compile_ok and not after.compile_ok then
-  fallback_applied = true
-end
+dependencies = {
+  globals = { reads = ..., resolved_reads = ..., unresolved_reads = ... },
+  metatable = { gets = ..., sets = ..., metamethod_keys = ... },
+  proxies = { roots = ..., reads = ... },
+  require = ...
+}
 ```
-
-Lint summary is always produced for before/after context in safety report.
 
 ---
 
-## 11. Output Artifacts
+## 10. Dependency Analysis (`src/rrequire.lua`)
 
-## 11.1 Main output
+Goal:
+- build `require` dependency graph from entry file
 
-- `output/<filename>`
+Flow:
+1. Parse a file and collect require calls (AST path)
+2. If AST path fails, fallback token scan (`lexer_full`)
+3. Resolve module names to file paths via:
+   - caller-relative candidates
+   - root-dir candidates
+   - `.lua` and `init.lua` variants
+   - `package.path` pattern candidates
+4. Traverse graph breadth-first
+5. Detect cycles via DFS back-edge tracking
 
-## 11.2 Safety report
+Output structure:
+- `nodes`, `edges`, `adjacency`, `cycles`
+- `unresolved`, `dynamic`, `parse_errors`
+- `summary`
 
-- `output/<filename>.safety.json`
+---
 
-Schema (high-level):
+## 11. Preset Pipeline (`src/preset.lua` + `preset.json`)
+
+Preset runner executes steps sequentially on a single in-memory source buffer.
+
+Step contract fields:
+- `name`, `mode`, `enabled`
+- optional `scope`, `engine`, `dialect`, `lint_dynamic`, `write_output`
+
+Preset-level fields:
+- `engine`
+- `write_step_outputs`
+- `stop_on_error`
+- `steps`
+
+Sequential overwrite contract:
+- output of step `N` is input of step `N+1`
+- no branch fanout unless step snapshots are explicitly written
+
+Per-step safety:
+- each step runs `Safety.guard`
+- step report stores fallback status and reason
+
+Output files:
+- final: `output/<file>`
+- report: `output/<file>.preset.json`
+- optional snapshots: `output/preset_steps/<file>.stepXX_<name>.lua`
+
+---
+
+## 12. Safety System (`src/safety.lua`)
+
+`Safety.analyze_source` computes:
+- parse status
+- compile status
+- static lint summary
+
+`Safety.guard` enforces:
+- parse regression prevention
+- compile regression prevention
+- fallback to original source on invariant failure
+
+Safety report schema:
 
 ```json
 {
   "type": "safety-report",
-  "mode": "string",
-  "generated_at": "ISO-8601",
-  "before": {
-    "parse_ok": true,
-    "compile_ok": true,
-    "lint_summary": {"total": 0, "error": 0, "warning": 0, "info": 0}
-  },
-  "after": {"parse_ok": true, "compile_ok": true, "lint_summary": {}},
+  "mode": "...",
+  "dialect": "auto",
+  "before": { "parse_ok": true, "compile_ok": true, "lint_summary": {} },
+  "after": { "parse_ok": true, "compile_ok": true, "lint_summary": {} },
   "fallback_applied": false,
   "fallback_reason": null
 }
 ```
 
-## 11.3 Mode-specific reports
+---
 
-- `lint`: `output/<filename>.lint.json`
-- `rrequire`: `output/<filename>.rrequire.json`
-- `preset`: `output/<filename>.preset.json`
+## 13. Utility Modules
 
-Optional preset step snapshots:
+## 13.1 `src/json.lua`
 
-- `output/preset_steps/<filename>.stepXX_<name>.lua`
-- `output/preset_steps/<filename>.stepXX_<name>.safety.json`
+Encoder:
+- deterministic key sort for objects
+- pretty mode enabled by default
+- cycle-safe output via `"<cycle>"`
+- arrays detected by contiguous `1..N` integer keys
+
+Decoder:
+- strict parser for object/array/string/number/bool/null
+- explicit error positions on malformed input
+
+## 13.2 `src/dialect.lua`
+
+Current implementation is intentionally simplified:
+- `resolve(_)` always returns one fixed profile (`auto`)
+- `is_valid(_)` always `true`
+- `list()` returns only `{ "auto" }`
+
+Implication:
+- parser/lexer feature gating exists in code, but runtime dialect choice is effectively fixed in current state.
 
 ---
 
-## 12. Performance Characteristics
+## 14. End-to-end Command Matrix
 
-Approximate complexity by dominant phase:
-
-- Lexer/token stream passes: `O(n)`
-- Parser: `O(n)` for valid code
-- Formatter/compressor streaming: `O(n)`
-- Renamer: `O(n)` AST walk + replacement sort `O(k log k)` where `k` is replacement count
-- Nocode: up to 20 optimization/prune cycles; worst-case `O(20n)` plus codegen
-- Rrequire graph traversal: `O(V + E)` across resolved files (plus parse cost per file)
-
-Memory behavior:
-
-- Most transforms hold full source and token list simultaneously
-- AST-based modes additionally hold full AST
+| CLI mode | Core module(s) | Output mutation | Extra report |
+|---|---|---|---|
+| `functionlocal` | `transformer_line` / `transformer` | yes | safety |
+| `localkw` | `transformer_line` / `transformer` | yes | safety |
+| `localte` | `transformer_line` / `transformer` | yes | safety |
+| `localc` / `localcyt` | `transformer_line` / `transformer` | yes | safety |
+| `localnum` | `transformer_line` / `transformer` | yes | safety |
+| `localtabke` | `transformer_line` / `transformer` | yes | safety |
+| `outcode` | `transformer_line` | yes | safety |
+| `deleteout` | `deleteout` | yes | safety |
+| `fom` | `formatter` | yes | safety |
+| `coml` | `compressor` | yes | safety |
+| `nmbun` | `nmbun` + `optimizer` | yes | safety |
+| `rename` | `renamer` | yes | safety |
+| `nocode` | `nocode` + `optimizer` | yes | safety |
+| `lint` | `linter` + optional dynamic | no (returns source) | `.lint.json` + safety |
+| `rrequire` | `rrequire` | no (returns source) | `.rrequire.json` + safety |
+| `preset` | `preset` | yes (step pipeline) | `.preset.json` + safety |
 
 ---
 
-## 13. Debug and Regression Tooling
+## 15. Practical Code-path Examples
 
-Use debug scripts in `test/`:
+## 15.1 Main dispatch example
 
-```bash
-lua54 test/debug_tokens.lua test.lua
-lua54 test/debug_parser.lua test.lua
-lua54 test/debug_ast.lua test.lua
-lua54 test/debug_parse_suite.lua
-lua54 test/debug_local_modes.lua
+```lua
+elseif mode == 'coml' then
+  local output_code = Compressor.compress(source, { dialect = dialect.name })
+  return finalize(output_code, { all_locals = {} })
+end
 ```
 
-Fixtures:
+## 15.2 Preset sequential overwrite example
 
-- `test/fixtures/parser_ok.lua`
-- `test/fixtures/parser_error.lua`
-- `test/fixtures/local_modes.lua`
+```lua
+local guarded_output, safety_report = Safety.guard(internal_mode, current_source, out_code, step_before, { dialect = step_dialect })
+current_source = guarded_output
+```
 
-Recommended CI-style smoke sequence:
+## 15.3 Dynamic lint trace example
 
-1. parser suite
-2. local mode matrix
-3. selected command smoke (`fom`, `coml`, `rename`, `nocode`, `lint`, `rrequire`, `preset`)
-
----
-
-## 14. Extension Protocol
-
-When adding a new command:
-
-1. implement `src/<feature>.lua`
-2. add module require in `main.lua`
-3. add `process_file()` branch
-4. add CLI parse + mode mapping
-5. add report output contract if report-producing
-6. wire safety expectations (parse/compile invariants)
-7. add debug fixture and runner in `test/`
-8. update `README.md` and this file
-
-Preferred design policy:
-
-- If semantics change, use AST + safety fallback
-- If formatting/layout preservation is primary, use token/position rewrite
+```lua
+record(trace.require_calls, key)
+push_history(trace, 'require', key)
+record_event(trace, 'info', 'require-call', "require('" .. key .. "')")
+```
 
 ---
 
-## 15. Known Risks and Technical Debt
+## 16. Current Technical Debt / Accuracy Notes
 
-1. `Analyzer` implementation has mismatches with current AST chunk shape and is not the primary authority in line-engine default flow.
-2. `Transformer` AST mode has duplicated conditional branches and weaker parity with `TransformerLine` for all mode variants.
-3. Lexer/parser are practical but not a formally complete Luau grammar.
-4. Some command aliases (`localtur`) remain for compatibility and should be normalized/cleaned in future refactor.
+1. `main.lua` argument parser currently consumes `--dialect=...` without wiring it to runtime dialect selection.
+2. `src/dialect.lua` is currently single-profile (`auto`) and does not enforce per-version mode separation.
+3. `src/analyzer.lua` chunk walker shape differs from `AST.Chunk` shape (`node.body` vs `node.body.statements`).
+4. AST transformer path has narrower practical use than line transformer for local-removal operations.
 
-Mitigation currently in place:
-
-- command outputs are guarded by `Safety.guard`
-- fallback to input on parse/compile regression
-- debug scripts for parser and local-mode matrix
+These are implementation facts, not hypothetical risks.
 
 ---
 
-## 16. Quick Operational Checklist
+## 17. Extension Checklist (How to add a new command)
 
-Before release:
+1. Add module `src/<feature>.lua`.
+2. Require module in `main.lua`.
+3. Add branch in `process_file()`.
+4. Add CLI parse block for mode and arguments.
+5. Add mode mapping to internal mode string if needed.
+6. Add report output contract if command emits JSON report.
+7. Ensure command output goes through `Safety.guard`.
+8. Update `README.md` and this file.
 
-1. run parser suite
-2. run local mode matrix
-3. run representative command matrix on real scripts
-4. confirm safety reports show `fallback_applied = false` for healthy paths
-5. inspect lint/rrequire JSON shape compatibility
-6. verify preset sequential overwrite semantics
+Minimal example branch pattern:
 
-This document should be treated as the authoritative architecture contract until the next implementation change.
+```lua
+elseif mode == '<newmode>' then
+  local output_code, analyzer, meta = NewModule.run(source, { dialect = dialect.name })
+  return finalize(output_code, analyzer, meta)
+end
+```
+
+---
+
+## 18. File-by-file API Contract (Non-test)
+
+This section is an implementation index: each non-test file, its callable entrypoints, I/O, and safety profile.
+
+### 18.1 Root files
+
+#### `main.lua`
+- Public functions:
+  - `read_file(filepath)`
+  - `write_file(filepath, content)`
+  - `ensure_dir(dirpath)`
+  - `process_file(input_filepath, mode, engine, options)`
+  - `show_usage()`
+  - `main()`
+- Input:
+  - CLI args + source file bytes.
+- Output:
+  - transformed source file in `output/`.
+  - optional report files (`.lint.json`, `.rrequire.json`, `.preset.json`, always `.safety.json`).
+- Failure model:
+  - file I/O error -> hard error.
+  - command regression -> `Safety.guard` fallback.
+
+#### `preset.json`
+- Role:
+  - declarative step pipeline for `preset` command.
+- Contract:
+  - top-level defaults + ordered `steps[]`.
+  - per-step override of mode/scope/engine/dialect/dynamic lint flags.
+
+#### `README.md`
+- Role:
+  - user-facing command contract and examples.
+- Requirement:
+  - must stay synchronized with `show_usage()` and dispatch table in `main.lua`.
+
+#### `ARCHITECTURE.md`
+- Role:
+  - implementation-oriented behavior and contract map.
+
+### 18.2 Core syntax stack
+
+#### `src/ast.lua`
+- Export:
+  - AST constructor table (`AST.<Node>()`).
+- Contract:
+  - constructors are pure; they build node tables and do no I/O.
+- Used by:
+  - parser, optimizer, transformers, generator.
+
+#### `src/lexer.lua`
+- Export:
+  - `Lexer.new(source, options)` and tokenizing methods.
+- Output token shape:
+  - `{ type, value, line, col }`.
+- Failure model:
+  - malformed token (string/number) -> lexer error.
+
+#### `src/lexer_full.lua`
+- Export:
+  - `LexerFull.new(source, options)`, `:tokenize()`.
+- Output token shape:
+  - includes trivia (`comment`, `newline`) and symbols for layout-sensitive transforms.
+- Used by:
+  - formatter, compressor, deleteout, fallback scanners.
+
+#### `src/parser.lua`
+- Export:
+  - `Parser.new(tokens, options)`, `:parse()`.
+- Input:
+  - parser-lexer token stream.
+- Output:
+  - `AST.Chunk`.
+- Failure model:
+  - syntax or feature-gate violation -> error with token context.
+
+#### `src/codegen.lua`
+- Export:
+  - `CodeGen.new(source)`, `:generate(ast)`.
+- Input:
+  - AST (+ optional original source for indent preservation).
+- Output:
+  - regenerated Lua text.
+- Safety:
+  - string escaping is explicit (`quote_lua_string`).
+
+### 18.3 Analysis and transformation
+
+#### `src/analyzer.lua`
+- Export:
+  - `Analyzer.new()`, `:analyze(ast)`, `:get_local_info()`.
+- Output:
+  - local symbol usage map for summary output.
+- Note:
+  - current chunk walk shape mismatch can lower precision in some AST flows.
+
+#### `src/transformer.lua`
+- Export:
+  - `Transformer.new(options)`, `:transform(ast)`.
+- Behavior:
+  - AST rewrite for local-removal modes.
+
+#### `src/transformer_line.lua`
+- Export:
+  - `TransformerLine.new(source, tokens, options)`, `:apply()`.
+- Behavior:
+  - line/column targeted `local` removal with layout preservation.
+- Why default:
+  - more robust for whitespace-sensitive user expectations.
+
+#### `src/formatter.lua`
+- Export:
+  - `Formatter.format(source, options)`.
+- Behavior:
+  - readability reflow, indentation normalization, call/table readability improvements.
+
+#### `src/compressor.lua`
+- Export:
+  - `Compressor.compress(source, options)`.
+- Behavior:
+  - AST optimization candidate + token minify candidate + strict parse/compile validation.
+- Failure model:
+  - invalid candidate is rejected; returns safe original/candidate fallback only.
+
+#### `src/optimizer.lua`
+- Export:
+  - `Optimizer.optimize(chunk)`.
+- Behavior:
+  - constant folding and control-flow simplification on AST.
+
+#### `src/nmbun.lua`
+- Export:
+  - `Nmbun.run(source, options)`.
+- Behavior:
+  - parser + optimizer passes + codegen.
+- Output:
+  - simplified source + analyzer-like summary object.
+
+#### `src/renamer.lua`
+- Export:
+  - `Renamer.rename(source, options)`.
+- Behavior:
+  - lexical-scope local renaming with collision-safe short names.
+- Safety:
+  - byte-span replacements validated against original identifiers before write.
+
+#### `src/deleteout.lua`
+- Export:
+  - `DeleteOut.strip(source, options)`.
+- Behavior:
+  - remove comments while preserving token boundary safety and line structure.
+
+#### `src/nocode.lua`
+- Export:
+  - `NoCode.clean(source, options)`.
+- Behavior:
+  - conservative dead local removal with side-effect checks and parse/compile validation.
+
+### 18.4 Diagnostics, graphing, safety, runtime
+
+#### `src/linter.lua`
+- Export:
+  - `Linter.run(source, options)`, `Linter.format_report(result, input_filepath)`.
+- Behavior:
+  - static diagnostics + optional dynamic integration.
+- Output:
+  - structured lint result object consumed by `main.lua`.
+
+#### `src/lint_dynamic.lua`
+- Export:
+  - `LintDynamic.run(source, options)`.
+- Behavior:
+  - runtime execution with budgets, event aggregation, dependency summarization.
+
+#### `src/lint_sandbox.lua`
+- Export:
+  - `LintSandbox.build(options)`.
+- Behavior:
+  - instrumented environment/proxy layer for dynamic lint.
+- Output:
+  - trace maps/events/history/dependency details.
+
+#### `src/rrequire.lua`
+- Export:
+  - `RRequire.analyze(entry_file, options)`, `RRequire.format_report(result)`.
+- Behavior:
+  - require graph extraction + module path resolution + cycle detection.
+
+#### `src/safety.lua`
+- Export:
+  - `Safety.analyze_source(source, options)`, `Safety.guard(mode, source, output, before_analysis, options)`.
+- Contract:
+  - prevents parse/compile regressions by fallback.
+
+#### `src/preset.lua`
+- Export:
+  - `Preset.run(input_filepath, preset_filepath, default_engine, options)`.
+- Behavior:
+  - ordered in-memory step execution with per-step safety guarding and JSON reporting.
+
+### 18.5 Utilities
+
+#### `src/json.lua`
+- Export:
+  - `Json.encode(value, pretty)`, `Json.decode(input)`.
+- Behavior:
+  - deterministic pretty JSON + strict decode parser.
+
+#### `src/dialect.lua`
+- Export:
+  - `Dialect.resolve(_)`, `Dialect.is_valid(_)`, `Dialect.list()`.
+- Current contract:
+  - runtime behavior is fixed to one profile (`auto`) in current implementation.
+
+---
+
+## 19. Command Failure/Fallback Guarantees
+
+All mutating commands in `main.lua` are wrapped by `finalize()` -> `Safety.guard()`.
+
+Guarantees:
+1. If source parses before transform, parseability regression is blocked.
+2. If source compiles before transform, compile regression is blocked.
+3. On blocked regression, emitted output is original source and reason is in `.safety.json`.
+
+Operational implication:
+- aggressive transforms (`coml`, `nocode`, `nmbun`, AST/line local rewrites) are fail-closed.
+- non-mutating commands (`lint`, `rrequire`) still emit safety report for uniform observability.
+
+---
+
+## 20. Summary
+
+This codebase is a safety-first source-to-source transformation and analysis CLI.
+The architecture combines:
+- token-level layout-sensitive editing,
+- AST-level semantic rewriting,
+- conservative safety fallback,
+- structured JSON observability for lint/dependency/preset execution.
+
+For implementation-level details, this file should be treated as the authoritative map of current non-test runtime behavior.
